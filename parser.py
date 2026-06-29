@@ -90,7 +90,6 @@ def _detect_level(raw_level: str | None, data: dict[str, Any] | None = None) -> 
 
 
 def _extract_json_fields(data: dict[str, Any]) -> tuple[str, str, str]:
-    """Returns (timestamp, service, message)."""
     ts = ""
     for key in ("timestamp", "time", "ts", "@timestamp", "date"):
         val = data.get(key)
@@ -118,30 +117,25 @@ def _extract_json_fields(data: dict[str, Any]) -> tuple[str, str, str]:
 
 
 class StackTraceCollector:
-
     def __init__(self) -> None:
         self._collecting = False
         self._head_entry: LogEntry | None = None
         self._lines: list[str] = []
 
     def feed(self, entry: LogEntry) -> list[LogEntry]:
-
         line = entry.raw
-
         if self._collecting:
             is_continuation = bool(_TRACEBACK_CONTINUATION.match(line)) or line.strip() == ""
             if is_continuation and line.strip():
                 self._lines.append(line.rstrip())
                 return []
             else:
-                # трейс завершён
                 assert self._head_entry is not None
                 self._head_entry.stacktrace_lines = list(self._lines)
                 finished = self._head_entry
                 self._collecting = False
                 self._head_entry = None
                 self._lines = []
-
                 if _TRACEBACK_START.match(line):
                     self._collecting = True
                     entry.is_stacktrace_head = True
@@ -170,7 +164,6 @@ class StackTraceCollector:
 
 
 class LogParser:
-
     @staticmethod
     def parse(raw: str, source_id: str = "") -> LogEntry:
         stripped = raw.strip()

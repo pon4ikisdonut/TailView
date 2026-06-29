@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,14 +19,38 @@ try:
 except ImportError:
     pass
 
-
 LineCallback = Callable[[str], None]
+
+IGNORED_PATTERNS: list[str] = [
+    "*.gz", "*.zip", "*.bz2", "*.xz", "*.zst",
+    "*.tar", "*.tar.*",
+    "lastlog", "wtmp", "btmp", "faillog", "utmp",
+    "*.journal",
+    "*.bin", "*.dat", "*.db", "*.sqlite",
+    "*.png", "*.jpg", "*.svg", "*.ico",
+    "*.so", "*.pyc", "*.pyo",
+    "pacman.log",
+]
+
+_IGNORED_RE = re.compile(
+    "|".join(
+        re.escape(p).replace(r"\*", ".*")
+        for p in IGNORED_PATTERNS
+    ),
+    re.IGNORECASE,
+)
+
+
+def _is_ignored(path: str) -> bool:
+    name = Path(path).name
+    return bool(_IGNORED_RE.fullmatch(name))
 
 
 @dataclass
 class LocalFileConfig:
     path: str
     tail_lines: int = 200
+    use_sudo: bool = False
 
 
 @dataclass
@@ -37,7 +61,7 @@ class SSHConfig:
     password: str = ""
     key_path: str = ""
     remote_path: str = ""
-    remote_os: str = "linux"  
+    remote_os: str = "linux"
     tail_lines: int = 200
 
 
@@ -60,26 +84,26 @@ class K8sConfig:
 @dataclass
 class KVMConfig:
     domain_name: str
-    log_path: str = "" 
+    log_path: str = ""
 
 
 class TailCommandStrategy(ABC):
     @abstractmethod
-    def build_command(self, path: str, tail_lines: int) -> list[str]:
+    def build_command(self, path: str, tail_lines: int, use_sudo: bool = False) -> list[str]:
         ...
 
 
 class LinuxTailStrategy(TailCommandStrategy):
-    def build_command(self, path: str, tail_lines: int) -> list[str]:
-        return ["tail", f"-n{tail_lines}", "-f", path]
+    def build_command(self, path: str, tail_lines: int, use_sudo: bool = False) -> list[str]:
+        cmd = ["tail", f"-n{tail_lines}", "-f", path]
+        if use_sudo:
+            cmd = ["sudo", "-n", "--"] + cmd
+        return cmd
 
 
 class WindowsTailStrategy(TailCommandStrategy):
-    def build_command(self, path: str, tail_lines: int) -> list[str]:
-        ps_cmd = (
-            f"Get-Content -Path '{path}' -Wait -Tail {tail_lines} "
-            f"-Encoding UTF8"
-        )
+    def build_command(self, path: str, tail_lines: int, use_sudo: bool = False) -> list[str]:
+        ps_cmd = f"Get-Content -Path '{path}' -Wait -Tail {tail_lines} -Encoding UTF8"
         return ["powershell", "-NonInteractive", "-Command", ps_cmd]
 
 
@@ -92,6 +116,9 @@ def _get_strategy(os_type: str) -> TailCommandStrategy:
 def _local_os() -> str:
     return "windows" if platform.system().lower() == "windows" else "linux"
 
+
+def _check_readable(path: str) -> bool:
+    return os.access(path, os.R_OK)
 
 
 class BaseProvider(ABC):
@@ -125,21 +152,36 @@ class LocalFileProvider(BaseProvider):
 
     async def stream(self) -> AsyncIterator[str]:
         self._running = True
-        cmd = self._strategy.build_command(self._config.path, self._config.tail_lines)
+        path = self._config.path
 
+        if not Path(path).exists():
+            yield f"[TailView] File not found: {path}"
+            return
+
+        if not _check_readable(path) and not self._config.use_sudo:
+            yield f"[TailView] Permission denied: {path}"
+            yield f"[TailView] Tip: re-add this source and enable 'Use sudo' option"
+            return
+
+        cmd = self._strategy.build_command(path, self._config.tail_lines, self._config.use_sudo)
         loop = asyncio.get_event_loop()
-        self._proc = await loop.run_in_executor(
-            None,
-            lambda: subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            ),
-        )
+
+        try:
+            self._proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                ),
+            )
+        except FileNotFoundError as e:
+            yield f"[TailView] Command not found: {e}"
+            return
 
         assert self._proc.stdout is not None
         while self._running:
@@ -172,18 +214,12 @@ class SSHProvider(BaseProvider):
         strategy = _get_strategy(cfg.remote_os)
         cmd_parts = strategy.build_command(cfg.remote_path, cfg.tail_lines)
         cmd = " ".join(shlex.quote(p) for p in cmd_parts)
-
         loop = asyncio.get_event_loop()
 
         client: paramiko.SSHClient = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        connect_kwargs: dict = dict(
-            hostname=cfg.host,
-            port=cfg.port,
-            username=cfg.username,
-            timeout=15,
-        )
+        connect_kwargs: dict = dict(hostname=cfg.host, port=cfg.port, username=cfg.username, timeout=15)
         if cfg.key_path:
             connect_kwargs["key_filename"] = cfg.key_path
         elif cfg.password:
@@ -222,8 +258,7 @@ class SSHProvider(BaseProvider):
         assert self._channel is not None
         try:
             self._channel.setblocking(False)
-            data = self._channel.recv(nbytes)
-            return data
+            return self._channel.recv(nbytes)
         except Exception:
             return None
 
@@ -251,22 +286,26 @@ class DockerProvider(BaseProvider):
         cfg = self._config
         target = cfg.container_name or cfg.container_id
         cmd = ["docker", "logs", "--follow", f"--tail={cfg.tail_lines}", target]
-
         loop = asyncio.get_event_loop()
-        self._proc = await loop.run_in_executor(
-            None,
-            lambda: subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            ),
-        )
-        assert self._proc.stdout is not None
 
+        try:
+            self._proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                ),
+            )
+        except FileNotFoundError:
+            yield "[TailView] docker not found in PATH"
+            return
+
+        assert self._proc.stdout is not None
         while self._running:
             line = await loop.run_in_executor(None, self._proc.stdout.readline)
             if not line:
@@ -296,15 +335,12 @@ def discover_docker_containers() -> list[DockerContainerInfo]:
             parts = line.split("\t")
             if len(parts) >= 4:
                 containers.append(DockerContainerInfo(
-                    container_id=parts[0],
-                    name=parts[1],
-                    image=parts[2],
-                    status=parts[3],
+                    container_id=parts[0], name=parts[1],
+                    image=parts[2], status=parts[3],
                 ))
         return containers
     except Exception:
         return []
-
 
 
 class K8sProvider(BaseProvider):
@@ -331,20 +367,24 @@ class K8sProvider(BaseProvider):
             cmd += [f"--kubeconfig={cfg.kubeconfig}"]
 
         loop = asyncio.get_event_loop()
-        self._proc = await loop.run_in_executor(
-            None,
-            lambda: subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            ),
-        )
-        assert self._proc.stdout is not None
+        try:
+            self._proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                ),
+            )
+        except FileNotFoundError:
+            yield "[TailView] kubectl not found in PATH"
+            return
 
+        assert self._proc.stdout is not None
         while self._running:
             line = await loop.run_in_executor(None, self._proc.stdout.readline)
             if not line:
@@ -357,10 +397,12 @@ class K8sProvider(BaseProvider):
 
 def discover_k8s_pods(namespace: str = "", kubeconfig: str = "") -> list[dict[str, str]]:
     try:
-        cmd = ["kubectl", "get", "pods", "--all-namespaces", "-o",
-               "custom-columns=NS:.metadata.namespace,NAME:.metadata.name,"
-               "READY:.status.containerStatuses[0].ready,STATUS:.status.phase",
-               "--no-headers"]
+        cmd = [
+            "kubectl", "get", "pods", "--all-namespaces", "-o",
+            "custom-columns=NS:.metadata.namespace,NAME:.metadata.name,"
+            "READY:.status.containerStatuses[0].ready,STATUS:.status.phase",
+            "--no-headers",
+        ]
         if kubeconfig:
             cmd += [f"--kubeconfig={kubeconfig}"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
@@ -414,6 +456,7 @@ def discover_kvm_domains() -> list[str]:
     except Exception:
         return []
 
+
 _DEFAULT_LOG_DIRS_LINUX = [
     "/var/log",
     "/var/log/nginx",
@@ -439,7 +482,7 @@ _GROUP_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"mysql|mariadb", re.I), "MySQL"),
     (re.compile(r"postgres|pg_", re.I), "PostgreSQL"),
     (re.compile(r"kern|syslog|messages|dmesg", re.I), "System"),
-    (re.compile(r"auth|secure|faillog|btmp|wtmp", re.I), "Auth"),
+    (re.compile(r"auth|secure|faillog", re.I), "Auth"),
     (re.compile(r"docker", re.I), "Docker"),
     (re.compile(r"kube|k8s", re.I), "Kubernetes"),
     (re.compile(r"libvirt|qemu|kvm", re.I), "KVM"),
@@ -451,6 +494,7 @@ class DiscoveredLog:
     path: str
     group: str
     name: str
+    readable: bool = True
 
 
 def discover_local_logs() -> list[DiscoveredLog]:
@@ -471,6 +515,8 @@ def discover_local_logs() -> list[DiscoveredLog]:
                 abs_path = str(f.resolve())
                 if abs_path in seen:
                     continue
+                if _is_ignored(abs_path):
+                    continue
                 seen.add(abs_path)
 
                 group = "Other"
@@ -483,6 +529,7 @@ def discover_local_logs() -> list[DiscoveredLog]:
                     path=abs_path,
                     group=group,
                     name=f.name,
+                    readable=_check_readable(abs_path),
                 ))
         except PermissionError:
             continue
